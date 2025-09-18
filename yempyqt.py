@@ -7,32 +7,28 @@ import base64
 import wmi
 import win32crypt
 from datetime import datetime, timedelta
+import ntplib
 
-# --- Gerekli Kütüphaneler ---
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLineEdit, QLabel, QListWidget, QTableWidget, QTableWidgetItem, QHeaderView,
                              QAbstractItemView, QMenu, QDialog, QDialogButtonBox, QMessageBox, QFileDialog,
-                             QStyle, QInputDialog)
+                             QStyle, QInputDialog, QStatusBar)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QDoubleValidator
 import openpyxl
 
 # --- Ayarlar ve Sabitler ---
-# Ana veri ve yedekleme klasörleri
+__version__ = "1.2.0" # Versiyon güncellendi
 DATA_FILE = "data.json"
 BACKUP_DIR = "backups"
-
-# Programın gizli ayar dosyalarını saklayacağı klasör (C:\Users\KullaniciAdi\AppData\Roaming\YemciApp)
 APP_CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'YemciApp')
-# Şifrelenmiş lisans dosyasının tam yolu
 SECURE_LICENSE_FILE = os.path.join(APP_CONFIG_DIR, 'license.bin')
+ACTIVATION_HISTORY_FILE = os.path.join(APP_CONFIG_DIR, 'activation.hist')
 
-# ÖNEMLİ: Bu anahtar, `key_generator.py` betiğini çalıştırdığınızda üretilen
-# AÇIK ANAHTAR (public key) ile değiştirilmelidir.
 PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn5YFTK5h/miQOwVBvTAt
+MIIBIjANBgkqhkiGOWBAQEFAAOCAQ8AMIIBCgKCAQEAn5YFTK5h/miQOwVBvTAt
 T2IX4SNBQgqJ1/lMlaJH7K2AoSuEYFqIgGB2EopPAKbxnI38I402EUxpJifopFIE
 ExttIaWT5CHyGd4SNohZGyshkmudkbwVHq5Zw5eHtcQS9MCnB73E5q8DQKVYyxDf
 JtcHcsr2dY7kUsUEvrOVjZkqYQm8ndl0jxvHZmw8zkuinUNs0QbNH46mm6cVEEGH
@@ -46,18 +42,15 @@ oQIDAQAB
 # GÜVENLİK VE DONANIM FONKSİYONLARI
 # =============================================================================
 class SecureDataManager:
-    """Windows DPAPI kullanarak verileri şifreler ve AppData'da saklar."""
     def __init__(self, file_path):
         self.file_path = file_path
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
-
     def write_data(self, data):
         try:
             encrypted_data = win32crypt.CryptProtectData(data.encode('utf-8'), None, None, None, None, 0)
             with open(self.file_path, 'wb') as f: f.write(encrypted_data)
             return True
         except Exception: return False
-
     def read_data(self):
         if not os.path.exists(self.file_path): return None
         try:
@@ -65,12 +58,10 @@ class SecureDataManager:
             _, decrypted_data = win32crypt.CryptUnprotectData(encrypted_data, None, None, None, 0)
             return decrypted_data.decode('utf-8')
         except Exception: return None
-
     def delete_file(self):
         if os.path.exists(self.file_path): os.remove(self.file_path)
 
 def get_machine_id():
-    """Bilgisayarın benzersiz donanım kimliğini (Anakart Seri Numarası) döndürür."""
     try:
         c = wmi.WMI()
         for board in c.Win32_BaseBoard():
@@ -85,24 +76,20 @@ def get_machine_id():
 # VERİ YÖNETİM SINIFI (JSON)
 # =============================================================================
 class DataManager:
-    """Müşteri verilerini (data.json) yönetir."""
     def __init__(self, filename=DATA_FILE):
         self.filename = filename
         self.companies = self.load_data()
-
     def load_data(self):
         if not os.path.exists(self.filename): return {}
         try:
             with open(self.filename, "r", encoding="utf-8") as f: data = json.load(f)
             return data
         except Exception: return {}
-
     def save_data(self):
         try:
             with open(self.filename, "w", encoding="utf-8") as f:
                 json.dump(self.companies, f, ensure_ascii=False, indent=4)
         except Exception: pass
-
     def backup_data(self):
         if not os.path.exists(BACKUP_DIR): os.makedirs(BACKUP_DIR)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -122,34 +109,66 @@ class CariApp(QMainWindow):
         self.setWindowTitle("Yemci Cari Hesap Yönetimi")
         self.setGeometry(100, 100, 1366, 768)
         self.setWindowIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        self.expiration_date = None
 
         self.data_manager = DataManager()
         self.companies = self.data_manager.companies
         self.current_company = None
         self._sort_column = 5
         self._sort_order = Qt.DescendingOrder
-
+        
         self._build_ui()
+        self._setup_status_bar()
         self._update_company_list()
 
-    # --- LİSANS KONTROL FONKSİYONLARI ---
-    def verify_and_process_license(self, license_key):
-        """Anahtarı doğrular, donanım kilidini kontrol eder ve lisansı kaydeder."""
+    def get_current_time(self):
         try:
-            public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
-            payload_b64, signature_b64 = license_key.split('.')
-            payload = base64.urlsafe_b64decode(payload_b64)
-            signature = base64.urlsafe_b64decode(signature_b64)
-            public_key.verify(signature, payload, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
-            parts = dict(part.split(':', 1) for part in payload.decode('utf-8').split(';'))
+            client = ntplib.NTPClient()
+            response = client.request('pool.ntp.org', version=3, timeout=3)
+            return datetime.fromtimestamp(response.tx_time)
+        except Exception:
+            return None
 
-            key_machine_id = parts.get('machine_id')
-            current_machine_id = get_machine_id()
-            if key_machine_id != current_machine_id:
-                QMessageBox.critical(self, "Lisans Hatası", f"Bu lisans anahtarı başka bir bilgisayara aittir.\n\nSizin Makine Kodunuz: {current_machine_id}")
+    def _setup_status_bar(self):
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.version_label = QLabel(f"Versiyon: {__version__}")
+        self.expiration_label = QLabel("Lisans Bitiş: -")
+        self.statusBar.addPermanentWidget(self.version_label)
+        self.statusBar.addPermanentWidget(QLabel(" | "))
+        self.statusBar.addPermanentWidget(self.expiration_label)
+
+    def _update_status_bar(self):
+        if self.expiration_date:
+            self.expiration_label.setText(f"Lisans Bitiş: {self.expiration_date.strftime('%d-%m-%Y')}")
+
+    def verify_and_process_license(self, license_key):
+        current_time = self.get_current_time()
+        if not current_time:
+            QMessageBox.critical(self, "Bağlantı Hatası", "Lisans etkinleştirilemedi. Lütfen internet bağlantınızı kontrol edin.")
+            return 0
+        try:
+            payload_b64, signature_b64 = license_key.split('.')
+            history_manager = SecureDataManager(ACTIVATION_HISTORY_FILE)
+            used_signatures_str = history_manager.read_data()
+            used_signatures = set(used_signatures_str.split(',')) if used_signatures_str else set()
+
+            if signature_b64 in used_signatures:
+                QMessageBox.critical(self, "Lisans Hatası", "Bu lisans anahtarı daha önce kullanılmış.")
                 return 0
 
-            license_data_to_save = f"{license_key}:::{datetime.now().strftime('%Y-%m-%d')}"
+            public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
+            payload = base64.urlsafe_b64decode(payload_b64)
+            public_key.verify(base64.urlsafe_b64decode(signature_b64), payload, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+            parts = dict(part.split(':', 1) for part in payload.decode('utf-8').split(';'))
+
+            if parts.get('machine_id') != get_machine_id():
+                QMessageBox.critical(self, "Lisans Hatası", f"Bu lisans anahtarı başka bir bilgisayara aittir.\n\nSizin Makine Kodunuz: {get_machine_id()}")
+                return 0
+
+            used_signatures.add(signature_b64)
+            history_manager.write_data(",".join(used_signatures))
+            license_data_to_save = f"{license_key}:::{current_time.strftime('%Y-%m-%d %H:%M:%S')}"
             s_manager = SecureDataManager(SECURE_LICENSE_FILE)
             s_manager.write_data(license_data_to_save)
             return 1
@@ -158,16 +177,19 @@ class CariApp(QMainWindow):
             return 0
 
     def check_license_at_startup(self):
-        """Program başlarken şifreli lisans dosyasını kontrol eder."""
+        current_time = self.get_current_time()
+        if not current_time:
+            QMessageBox.critical(self, "Bağlantı Hatası", "Programın çalışması için aktif bir internet bağlantısı gereklidir.")
+            return False
+
         s_manager = SecureDataManager(SECURE_LICENSE_FILE)
         secure_data = s_manager.read_data()
         if secure_data and ":::" in secure_data:
-            license_key, activation_date_str = secure_data.split(":::")
+            license_key, activation_datetime_str = secure_data.split(":::")
             try:
                 public_key = serialization.load_pem_public_key(PUBLIC_KEY_PEM.encode('utf-8'))
-                payload_b64, signature_b64 = license_key.split('.')
+                payload_b64, _ = license_key.split('.')
                 payload = base64.urlsafe_b64decode(payload_b64)
-                public_key.verify(base64.urlsafe_b64decode(signature_b64), payload, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
                 parts = dict(part.split(':', 1) for part in payload.decode('utf-8').split(';'))
 
                 if parts.get('machine_id') != get_machine_id():
@@ -175,12 +197,20 @@ class CariApp(QMainWindow):
                     s_manager.delete_file()
                     return self.prompt_for_new_license()
 
-                duration_days = int(parts.get('duration_days', 0))
-                expiration_date = datetime.strptime(activation_date_str, "%Y-%m-%d") + timedelta(days=duration_days)
-                if datetime.now() > expiration_date:
-                    QMessageBox.critical(self, "Lisans Hatası", f"Lisansınız {expiration_date.strftime('%d-%m-%Y')} tarihinde doldu.")
+                activation_datetime = datetime.strptime(activation_datetime_str, "%Y-%m-%d %H:%M:%S")
+                duration = timedelta(seconds=int(parts['duration_seconds'])) if 'duration_seconds' in parts else timedelta(days=int(parts.get('duration_days', 0)))
+                self.expiration_date = activation_datetime + duration
+                self._update_status_bar()
+
+                if current_time > self.expiration_date:
+                    QMessageBox.critical(self, "Lisans Hatası", f"Lisansınız {self.expiration_date.strftime('%d-%m-%Y %H:%M:%S')} tarihinde doldu.")
                     s_manager.delete_file()
                     return self.prompt_for_new_license()
+
+                days_remaining = (self.expiration_date.date() - current_time.date()).days
+                if days_remaining <= 3:
+                    QMessageBox.warning(self, "Lisans Uyarısı", f"Lisansınızın dolmasına {days_remaining} gün kaldı!")
+                
                 return True
             except Exception:
                 s_manager.delete_file()
@@ -188,25 +218,25 @@ class CariApp(QMainWindow):
         return self.prompt_for_new_license()
 
     def prompt_for_new_license(self):
-        """Kullanıcıya yeni lisans anahtarı soran diyalog."""
+        """Kullanıcıya yeni lisans anahtarı soran özel diyaloğu gösterir."""
         machine_id = get_machine_id()
-        license_key, ok = QInputDialog.getText(self, "Lisans Etkinleştirme",
-                                               f"Lütfen lisans anahtarınızı girin.\n\nMakine Kodunuz: {machine_id}\n(Bu kodu lisans almak için kullanın)")
-        if ok and license_key and self.verify_and_process_license(license_key) == 1:
-            QMessageBox.information(self, "Başarılı", "Lisans başarıyla etkinleştirildi!")
-            return True
+        dialog = LicenseDialog(machine_id, self)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            license_key = dialog.get_license_key()
+            if self.verify_and_process_license(license_key) == 1:
+                QMessageBox.information(self, "Başarılı", "Lisans başarıyla etkinleştirildi!")
+                self.check_license_at_startup() 
+                return True
         return False
 
-    # --- ARAYÜZ OLUŞTURMA VE YÖNETİMİ ---
     def _build_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
-
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_panel.setFixedWidth(300)
-
         company_add_layout = QHBoxLayout()
         self.entry_company_name = QLineEdit()
         self.entry_company_name.setPlaceholderText("Yeni Müşteri Adı")
@@ -216,17 +246,14 @@ class CariApp(QMainWindow):
         btn_add_company.clicked.connect(self.add_company)
         company_add_layout.addWidget(btn_add_company)
         left_layout.addLayout(company_add_layout)
-
         self.entry_search_company = QLineEdit()
         self.entry_search_company.setPlaceholderText("Müşteri Ara...")
         self.entry_search_company.textChanged.connect(self._filter_company_list)
         left_layout.addWidget(self.entry_search_company)
-
         left_layout.addWidget(QLabel("Müşteriler"))
         self.list_companies = QListWidget()
         self.list_companies.currentItemChanged.connect(self.on_company_select)
         left_layout.addWidget(self.list_companies)
-
         company_actions_layout = QHBoxLayout()
         btn_delete_company = QPushButton(self.style().standardIcon(QStyle.SP_TrashIcon), " Sil")
         btn_delete_company.clicked.connect(self.delete_selected_company)
@@ -236,7 +263,6 @@ class CariApp(QMainWindow):
         company_actions_layout.addWidget(btn_backup_data)
         left_layout.addLayout(company_actions_layout)
         main_layout.addWidget(left_panel)
-
         self.right_panel = QWidget()
         self.right_layout = QVBoxLayout(self.right_panel)
         main_layout.addWidget(self.right_panel)
@@ -279,7 +305,6 @@ class CariApp(QMainWindow):
         payment_layout.addWidget(btn_add_payment)
         input_layout.addLayout(payment_layout)
         self.right_layout.addWidget(input_frame)
-
         self.tree = QTableWidget()
         self.tree.setColumnCount(6)
         self.tree.setHorizontalHeaderLabels(["Tür", "Açıklama / Yem Adı", "Adet", "Birim Fiyat", "Toplam", "Tarih"])
@@ -291,7 +316,6 @@ class CariApp(QMainWindow):
         self.tree.doubleClicked.connect(self._edit_selected_row)
         self.tree.horizontalHeader().sortIndicatorChanged.connect(self._sort_treeview)
         self.right_layout.addWidget(self.tree)
-
         bottom_layout = QHBoxLayout()
         self.total_label = QLabel("Toplam Bakiye: 0.00 TL")
         self.total_label.setStyleSheet("font-size: 16px; font-weight: bold;")
@@ -303,7 +327,17 @@ class CariApp(QMainWindow):
         self.right_layout.addLayout(bottom_layout)
         self._sort_and_update_treeview()
 
-    # --- VERİ İŞLEME FONKSİYONLARI ---
+    def _add_operation(self, record_type, data_dict):
+        current_time = self.get_current_time()
+        if not current_time:
+            QMessageBox.critical(self, "Bağlantı Hatası", "İşlem kaydedilemedi. İnternet bağlantınızı kontrol edin.")
+            return
+        data_dict["tarih"] = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        rec = {"type": record_type, "data": data_dict}
+        self.companies[self.current_company].append(rec)
+        self._sort_and_update_treeview()
+        self.data_manager.save_data()
+
     def add_company(self):
         name = self.entry_company_name.text().strip()
         if name and name not in self.companies:
@@ -339,10 +373,8 @@ class CariApp(QMainWindow):
         if not all([yem, adet, fiyat]): return
         try:
             adet_f, fiyat_f = float(adet), float(fiyat)
-            rec = {"type": "purchase", "data": {"yem": yem, "adet": adet_f, "fiyat": fiyat_f, "toplam": adet_f * fiyat_f, "tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
-            self.companies[self.current_company].append(rec)
-            self._sort_and_update_treeview()
-            self.data_manager.save_data()
+            data = {"yem": yem, "adet": adet_f, "fiyat": fiyat_f, "toplam": adet_f * fiyat_f}
+            self._add_operation("purchase", data)
             self.entry_yem.clear(); self.entry_adet.clear(); self.entry_fiyat.clear()
         except ValueError: pass
 
@@ -351,17 +383,13 @@ class CariApp(QMainWindow):
         if not tutar: return
         try:
             tutar_f = float(tutar)
-            rec = {"type": "payment", "data": {"aciklama": aciklama, "tutar": tutar_f, "tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
-            self.companies[self.current_company].append(rec)
-            self._sort_and_update_treeview()
-            self.data_manager.save_data()
+            self._add_operation("payment", {"aciklama": aciklama, "tutar": tutar_f})
             self.entry_aciklama.clear(); self.entry_tutar.clear()
         except ValueError: pass
 
     def _get_selected_record_and_row(self):
         selected_items = self.tree.selectedItems()
         if not selected_items: return None, -1
-        # Sıralanmış listedeki indeksi döndür
         return self.companies[self.current_company][selected_items[0].row()], selected_items[0].row()
 
     def _edit_selected_row(self):
@@ -386,14 +414,11 @@ class CariApp(QMainWindow):
         if record and record["type"] == "purchase":
             data = record["data"]
             if QMessageBox.question(self, "Onay", f"'{data['yem']}' alımını {data['toplam']:.2f} TL tutarında bir ödeme ile kapatmak istediğinize emin misiniz?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-                rec = {"type": "payment", "data": {"aciklama": f"'{data['yem']}' alımı ödendi", "tutar": data['toplam'], "tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
-                self.companies[self.current_company].append(rec)
-                self._sort_and_update_treeview()
-                self.data_manager.save_data()
+                self._add_operation("payment", {"aciklama": f"'{data['yem']}' alımı ödendi", "tutar": data['toplam']})
 
     def _sort_and_update_treeview(self):
         if not self.current_company: return
-        key_map = lambda r: {0: r.get("type"), 1: r["data"].get("yem", r["data"].get("aciklama")), 2: r["data"].get("adet", 0), 3: r["data"].get("fiyat", 0), 4: r["data"].get("toplam", -r["data"].get("tutar", 0)), 5: datetime.strptime(r["data"]["tarih"], "%Y-%m-%d %H:%M:%S")}[self._sort_column]
+        key_map = lambda r: datetime.strptime(r["data"]["tarih"], "%Y-%m-%d %H:%M:%S")
         self.companies[self.current_company].sort(key=key_map, reverse=(self._sort_order == Qt.DescendingOrder))
         self._update_treeview(self.companies[self.current_company])
 
@@ -420,7 +445,8 @@ class CariApp(QMainWindow):
         self.total_label.setStyleSheet(f"font-size: 16px; font-weight: bold; {'color: red;' if total > 0 else 'color: green;'}")
 
     def _sort_treeview(self, column, order):
-        self._sort_column, self._sort_order = column, order
+        self._sort_column, self._sort_order = 5, order
+        self.tree.horizontalHeader().setSortIndicator(5, order)
         self._sort_and_update_treeview()
 
     def _show_context_menu(self, pos):
@@ -438,7 +464,7 @@ class CariApp(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(self, "Excel Olarak Kaydet", f"{self.current_company}_hesap_dokumu.xlsx", "Excel Dosyaları (*.xlsx)")
         if not filename: return
         try:
-            wb, ws = openpyxl.Workbook(), openpyxl.Workbook().active
+            wb = openpyxl.Workbook()
             ws = wb.active; ws.title = self.current_company
             ws.append(["Tür", "Açıklama / Yem Adı", "Adet", "Birim Fiyat (TL)", "Toplam (TL)", "Tarih"])
             for record in self.companies.get(self.current_company, []):
@@ -447,18 +473,19 @@ class CariApp(QMainWindow):
             total = sum(r["data"].get("toplam", 0) - r["data"].get("tutar", 0) for r in self.companies[self.current_company])
             ws.append([]); ws.append(["", "", "", "TOPLAM BAKİYE:", total])
             wb.save(filename)
-        except Exception: pass
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Excel dosyası oluşturulurken bir hata oluştu: {e}")
 
     def backup_data(self):
         success, message = self.data_manager.backup_data()
-        QMessageBox.information(self, "Başarılı" if success else "Hata", message)
+        QMessageBox.information(self, "Yedekleme" if success else "Hata", message)
 
     def closeEvent(self, event):
         self.data_manager.save_data()
         event.accept()
 
 # =============================================================================
-# DÜZENLEME PENCERELERİ
+# DÜZENLEME VE LİSANS PENCERELERİ
 # =============================================================================
 class EditPurchaseDialog(QDialog):
     def __init__(self, parent, old_record):
@@ -498,6 +525,54 @@ class EditPaymentDialog(QDialog):
         new_data = {"aciklama": self.e_aciklama.text().strip() or "Ödeme", "tutar": float(self.e_tutar.text().replace(',', '.')), "tarih": self.old_record["data"]["tarih"]}
         return {"type": "payment", "data": new_data}
 
+class LicenseDialog(QDialog):
+    """Makine kodunu göstermek ve kopyalamak için özel lisans giriş diyaloğu."""
+    def __init__(self, machine_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lisans Etkinleştirme")
+        self.machine_id = machine_id
+        self.license_key = ""
+
+        layout = QVBoxLayout(self)
+        info_label = QLabel("Lütfen lisans anahtarınızı aşağıdaki alana girin.")
+        layout.addWidget(info_label)
+
+        machine_id_layout = QHBoxLayout()
+        machine_id_layout.addWidget(QLabel("<b>Makine Kodunuz:</b>"))
+        machine_id_display = QLineEdit(self.machine_id)
+        machine_id_display.setReadOnly(True)
+        machine_id_layout.addWidget(machine_id_display)
+        
+        copy_button = QPushButton(self.style().standardIcon(QStyle.SP_FileLinkIcon), " Kopyala")
+        copy_button.setToolTip("Makine kodunu panoya kopyala")
+        copy_button.clicked.connect(self.copy_machine_id)
+        machine_id_layout.addWidget(copy_button)
+        layout.addLayout(machine_id_layout)
+
+        layout.addWidget(QLabel("<b>Lisans Anahtarı:</b>"))
+        self.license_entry = QLineEdit()
+        self.license_entry.setPlaceholderText("Lisans anahtarını buraya yapıştırın")
+        layout.addWidget(self.license_entry)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def copy_machine_id(self):
+        QApplication.clipboard().setText(self.machine_id)
+        QMessageBox.information(self, "Kopyalandı", "Makine kodu panoya kopyalandı!")
+
+    def accept(self):
+        self.license_key = self.license_entry.text().strip()
+        if not self.license_key:
+            QMessageBox.warning(self, "Eksik Bilgi", "Lütfen bir lisans anahtarı girin.")
+            return
+        super().accept()
+
+    def get_license_key(self):
+        return self.license_key
+
 # =============================================================================
 # UYGULAMAYI BAŞLATMA
 # =============================================================================
@@ -511,12 +586,12 @@ if __name__ == "__main__":
         QPushButton:hover { background-color: #0056b3; }
         QLineEdit { border: 1px solid #d3d3d3; border-radius: 4px; padding: 6px; }
         QHeaderView::section { background-color: #e9ecef; padding: 4px; border: 1px solid #d3d3d3; font-weight: bold; }
+        QStatusBar { background-color: #e9ecef; }
     """)
-
     main_window = CariApp()
-
     if main_window.check_license_at_startup():
         main_window.show()
         sys.exit(app.exec_())
     else:
-        sys.exit()
+        sys.exit(1)
+
